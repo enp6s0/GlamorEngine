@@ -1,12 +1,12 @@
 #!/usr/bin/python3
 #
-# CameraEngine
+# GlamorEngine
 #
-# A standalone compositor for webcams
+# A standalone virtual background compositor for webcams
 # designed to be used standalone in a somewhat air-gapped environment
 #
 import cv2, time, multiprocessing, os
-print("CameraEngine v0.1 is starting...")
+print("GlamorEngine v0.1 is starting...")
 
 # specify device
 DEVICE = "/dev/v4l/by-id/usb-046d_081b_8D13BC60-video-index0"
@@ -30,45 +30,60 @@ tdOutFrame = cv2.putText(tdOutFrame, f"Initializing VideoEngine...", (30, 700), 
 cv2.imshow("output", tdOutFrame)
 cv2.waitKey(5)
 
-# Import TensorFlow and Bodypix prerequisites (will take some time)
-from pathlib import Path
-import numpy as np
-import tensorflow as tf
-from tf_bodypix.api import download_model, load_model, BodyPixModelPaths
+# Load virtual background
+virtualBG = cv2.imread(f"{scriptDir}/assets/backgrounds/bg1.jpg", cv2.IMREAD_COLOR)
+virtualBG = cv2.resize(virtualBG, (1280, 720), cv2.INTER_AREA)
 
-bpxModel = None
-def loadBodypixModel():
-    # Load BodyPix model
-    global bpxModel
-    try:
-        # tfjs version
-        #bpxModel = load_model(f"{scriptDir}/models/8ba301b16e59fd7bda330880a9d70e58--tfjs-models-savedmodel-bodypix-mobilenet-float-050-model-stride16")
+# Import MediaPipe
+import mediapipe as mp
+import numpy 
 
-        # tflite version
-        bpxModel = load_model(f"{scriptDir}/models/tflite/mobilenet-float-multipler-050-stride16-float16.tflite")
+def hologram(frame):
+    # Hologram effect from https://elder.dev/posts/open-source-virtual-background/
 
-        return True
-    except Exception as e:
-        print(f"Bodypix load error: {e}")
-        bpxModel = None
-        return f"{e}"
+    holo = cv2.applyColorMap(frame, cv2.COLORMAP_WINTER)
+    bandLength, bandGap = 2, 3
+
+    for y in range(holo.shape[0]):
+
+        if y % (bandLength+bandGap) < bandLength:
+
+            holo[y,:,:] = holo[y,:,:] * np.random.uniform(0.1, 0.3)
+
+
+    def shift_img(img, dx, dy):
+        img = np.roll(img, dy, axis=0)
+        img = np.roll(img, dx, axis=1)
+
+        if dy>0:
+            img[:dy, :] = 0
+
+        elif dy<0:
+            img[dy:, :] = 0
+
+        if dx>0:
+            img[:, :dx] = 0
+
+        elif dx<0:
+            img[:, dx:] = 0
+
+        return img
+
+
+    holo2 = cv2.addWeighted(holo, 0.2, shift_img(holo.copy(), 5, 5), 0.8, 0)
+    holo2 = cv2.addWeighted(holo2, 0.4, shift_img(holo.copy(), -5, -5), 0.6, 0)
+
+    holo_done = cv2.addWeighted(frame, 0.5, holo2, 0.6, 0)
+
+    return holo_done
 
 # Main loop, so whenever there is an exception, we return here and try again
 while True:
 
-    # OpenCV fullscreen named window that we can output stuff to later
-    # cv2.namedWindow("output", cv2.WND_PROP_FULLSCREEN)
-    # cv2.setWindowProperty("output",cv2.WND_PROP_FULLSCREEN,cv2.WINDOW_FULLSCREEN)
-    # cv2.imshow("output", img)
-
     try:
-
-        # Load bodypix masking (glamor) model
-        bpxLoad = loadBodypixModel()
-
-        # Did we have the bodypix model?
-        if bpxModel is None:
-            raise Exception(f"E007: glamor: {bpxLoad}")
+        # Selfie segmentation
+        mpss = mp.solutions.selfie_segmentation
+        ss = mpss.SelfieSegmentation(model_selection = 0)
 
         # Open capture device
         cam = cv2.VideoCapture(DEVICE)
@@ -91,14 +106,31 @@ while True:
             frame = cv2.resize(frame, (1280, 720), cv2.INTER_AREA)
 
             # Pass along frame to bodypix for mask processing
-            bpxResult = bpxModel.predict_single(frame)
-            bpxMask = bpxResult.get_mask(threshold = 0.75).numpy().astype(np.uint8)
+            results = ss.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            condition = np.stack((results.segmentation_mask,) * 3, axis=-1) > 0.1
+            black = np.zeros(frame.shape, dtype = np.uint8)
+            white = np.zeros(frame.shape, dtype = np.uint8)
+            white[:] = (255, 255, 255)
 
-            # Bodypix masking
-            masked = cv2.bitwise_and(frame, frame, mask = bpxMask)
+            # Create mask alone
+            mask = np.where(condition, white, black)
+
+            # Smooth out mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
+            (thresh, binRed) = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=3)
+
+            # Now do a hologram effect and masking all in one go :)
+            cameraOutput = np.where(mask, hologram(frame), black)
+
+            # Lay it on top of the virtual background
+            invertedMask = 1 - mask
+            croppedBG = np.where(invertedMask, virtualBG, black)
+
+            output = cv2.addWeighted(croppedBG, 1.0, cameraOutput, 0.98, 0)
 
             # Display
-            cv2.imshow("output", masked) # frame
+            cv2.imshow("output", output) # frame
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 exit(0)
 
